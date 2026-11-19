@@ -8,6 +8,7 @@
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 
@@ -69,8 +70,8 @@ esp_err_t WifiManager::init() {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Giảm công suất phát để chống sụt áp
-    esp_wifi_set_max_tx_power(60);
+    // Giảm công suất phát để chống sụt áp nguồn (14 dBm = 56 x 0.25 dBm)
+    esp_wifi_set_max_tx_power(56);
 
     ESP_LOGI(TAG, "WifiManager khởi tạo chế độ STA thành công.");
     return ESP_OK;
@@ -120,8 +121,8 @@ esp_err_t WifiManager::initApSta(const std::string& apSsid, const std::string& a
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &apConfig));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Giảm công suất phát để chống sụt áp
-    esp_wifi_set_max_tx_power(60);
+    // Giảm công suất phát để chống sụt áp nguồn (14 dBm = 56 x 0.25 dBm)
+    esp_wifi_set_max_tx_power(56);
 
     ESP_LOGI(TAG, "Đã khởi chạy AP: [%s] (IP AP: 192.168.4.1)", actualSsid.c_str());
     return ESP_OK;
@@ -166,6 +167,53 @@ esp_err_t WifiManager::disconnect() {
     ipAddress_ = "0.0.0.0";
     if (eventCallback_) eventCallback_(state_);
     return esp_wifi_disconnect();
+}
+
+esp_err_t WifiManager::saveCredentials(const std::string& ssid, const std::string& password) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("wifi_cfg", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+
+    nvs_set_str(handle, "ssid", ssid.c_str());
+    nvs_set_str(handle, "pass", password.c_str());
+    nvs_commit(handle);
+    nvs_close(handle);
+    ESP_LOGI(TAG, "Đã lưu Wi-Fi vào Flash NVS: SSID=[%s]", ssid.c_str());
+    return ESP_OK;
+}
+
+bool WifiManager::loadCredentials(std::string& ssid, std::string& password) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("wifi_cfg", NVS_READONLY, &handle);
+    if (err != ESP_OK) return false;
+
+    char sBuf[64] = {0};
+    char pBuf[64] = {0};
+    size_t sLen = sizeof(sBuf);
+    size_t pLen = sizeof(pBuf);
+
+    esp_err_t err1 = nvs_get_str(handle, "ssid", sBuf, &sLen);
+    esp_err_t err2 = nvs_get_str(handle, "pass", pBuf, &pLen);
+    nvs_close(handle);
+
+    if (err1 == ESP_OK && sLen > 1) {
+        ssid = sBuf;
+        password = (err2 == ESP_OK) ? pBuf : "";
+        return true;
+    }
+    return false;
+}
+
+esp_err_t WifiManager::clearCredentials() {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("wifi_cfg", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+
+    nvs_erase_all(handle);
+    nvs_commit(handle);
+    nvs_close(handle);
+    ESP_LOGI(TAG, "Đã xóa Wi-Fi khỏi Flash NVS.");
+    return ESP_OK;
 }
 
 std::vector<WifiApRecord> WifiManager::scanNetworks() {
@@ -213,6 +261,14 @@ void WifiManager::wifiEventHandler(void* arg, const char* eventBase, int32_t eve
                 self->state_ = WifiState::DISCONNECTED;
                 self->ipAddress_ = "0.0.0.0";
                 xEventGroupSetBits(eventGroup, WIFI_FAIL_BIT);
+
+                // Mất kết nối STA -> Tự động bật lại chế độ AP để người dùng có thể cấu hình lại
+                wifi_mode_t curMode;
+                if (esp_wifi_get_mode(&curMode) == ESP_OK && curMode == WIFI_MODE_STA) {
+                    ESP_LOGW(TAG, "Mất kết nối Wi-Fi nhà -> TỰ ĐỘNG BẬT LẠI AP để người dùng kết nối...");
+                    esp_wifi_set_mode(WIFI_MODE_APSTA);
+                }
+
                 if (self->eventCallback_) self->eventCallback_(self->state_);
                 ESP_LOGW(TAG, "Đã ngắt kết nối WiFi STA.");
                 break;
@@ -230,6 +286,16 @@ void WifiManager::wifiEventHandler(void* arg, const char* eventBase, int32_t eve
         xEventGroupSetBits(eventGroup, WIFI_CONNECTED_BIT);
 
         ESP_LOGI(TAG, "Đã nhận IP STA: %s", self->ipAddress_.c_str());
+
+        // Sau khi vào được STA -> TẮT CHẾ ĐỘ AP để tiết kiệm năng lượng, chống sụt áp và giải phóng tài nguyên RF
+        wifi_mode_t curMode;
+        if (esp_wifi_get_mode(&curMode) == ESP_OK && curMode != WIFI_MODE_STA) {
+            ESP_LOGI(TAG, "=========================================================");
+            ESP_LOGI(TAG, "📶 ĐÃ KẾT NỐI VÀO STA -> TIẾN HÀNH TẮT ĐIỂM PHÁT AP!");
+            ESP_LOGI(TAG, "=========================================================");
+            esp_wifi_set_mode(WIFI_MODE_STA);
+        }
+
         if (self->eventCallback_) self->eventCallback_(self->state_);
     }
 }

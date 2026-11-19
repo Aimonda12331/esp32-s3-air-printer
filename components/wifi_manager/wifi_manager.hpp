@@ -66,6 +66,22 @@ public:
     esp_err_t disconnect();
 
     /**
+     * @brief Lưu thông tin Wi-Fi vào Flash (NVS) để tự kết nối khi khởi động
+     */
+    esp_err_t saveCredentials(const std::string& ssid, const std::string& password);
+
+    /**
+     * @brief Tải thông tin Wi-Fi đã lưu từ Flash (NVS)
+     * @return true nếu đã từng lưu Wi-Fi
+     */
+    bool loadCredentials(std::string& ssid, std::string& password);
+
+    /**
+     * @brief Xóa thông tin Wi-Fi đã lưu trong Flash
+     */
+    esp_err_t clearCredentials();
+
+    /**
      * @brief Quét danh sách Wi-Fi xung quanh (chế độ passive scan chống sụt áp)
      */
     std::vector<WifiApRecord> scanNetworks();

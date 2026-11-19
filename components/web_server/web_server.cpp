@@ -1,9 +1,11 @@
 #include "web_server.hpp"
 #include "web_page.h"
 #include "wifi_manager.hpp"
+#include "file_manager.hpp"
 
 #include <cstring>
 #include <cstdlib>
+#include <memory>
 #include "esp_log.h"
 #include "mdns.h"
 #include "nvs_flash.h"
@@ -34,18 +36,6 @@ static std::string urlDecode(const std::string& in) {
         }
     }
     return out;
-}
-
-static std::string formatBytes(size_t bytes) {
-    char buf[32];
-    if (bytes >= 1024 * 1024) {
-        snprintf(buf, sizeof(buf), "%.1f MB", (float)bytes / (1024.0f * 1024.0f));
-    } else if (bytes >= 1024) {
-        snprintf(buf, sizeof(buf), "%.1f KB", (float)bytes / 1024.0f);
-    } else {
-        snprintf(buf, sizeof(buf), "%u B", (unsigned int)bytes);
-    }
-    return std::string(buf);
 }
 
 WebServer::~WebServer() {
@@ -128,8 +118,12 @@ esp_err_t WebServer::start(uint16_t port) {
     std::string name = getDeviceName();
     updateMdns(name);
 
+    // Khởi tạo FileManager quản lý hàng đợi tệp tin & Flash NVS
+    FileManager::getInstance().init();
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
+    config.stack_size = 10240; // Tăng stack lên 10KB (mặc định 4KB) để tránh tràn bộ đệm FreeRTOS khi tải file lớn
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
 
@@ -278,6 +272,9 @@ esp_err_t WebServer::handleConfig(httpd_req_t* req) {
 
     cJSON* resp = cJSON_CreateObject();
     if (connRet == ESP_OK) {
+        // Lưu thông tin Wi-Fi vào Flash NVS để tự động kết nối ở các lần khởi động sau
+        wifi.saveCredentials(ssid, pass);
+
         cJSON_AddStringToObject(resp, "status", "connected");
         cJSON_AddStringToObject(resp, "ip", wifi.getIpString().c_str());
         cJSON_AddStringToObject(resp, "hostname", WebServer::getInstance().getDeviceName().c_str());
@@ -312,23 +309,40 @@ esp_err_t WebServer::handleStatus(httpd_req_t* req) {
 }
 
 esp_err_t WebServer::handleUpload(httpd_req_t* req) {
-    char query[256] = {0};
     std::string filename = "tai_lieu_chua_dat_ten";
 
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        char val[128] = {0};
-        if (httpd_query_key_value(query, "filename", val, sizeof(val)) == ESP_OK) {
-            filename = urlDecode(val);
+    // 1. Kiểm tra tiêu đề HTTP header 'X-Filename'
+    char hdrVal[512] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-Filename", hdrVal, sizeof(hdrVal)) == ESP_OK && hdrVal[0] != '\0') {
+        filename = urlDecode(hdrVal);
+    } else {
+        // 2. Tìm trực tiếp trong req->uri để không bị giới hạn bộ đệm
+        const char* p = strstr(req->uri, "filename=");
+        if (p) {
+            p += 9; // Bỏ qua "filename="
+            const char* end = strchr(p, '&');
+            std::string rawName = end ? std::string(p, end - p) : std::string(p);
+            if (!rawName.empty()) {
+                filename = urlDecode(rawName);
+            }
         }
     }
 
+    if (filename.empty()) {
+        filename = "tai_lieu_chua_dat_ten";
+    }
+
     size_t totalBytes = req->content_len;
-    char chunk[1024];
+    ESP_LOGI(TAG, "Bắt đầu nhận tải file: [%s], dung lượng: %zu bytes", filename.c_str(), totalBytes);
+
+    // Cấp phát bộ đệm nhận stream trên Heap để không chiếm dụng task stack
+    constexpr size_t CHUNK_SIZE = 4096;
+    auto chunk = std::make_unique<char[]>(CHUNK_SIZE);
     size_t received = 0;
 
     while (received < totalBytes) {
-        int toRead = (totalBytes - received > sizeof(chunk)) ? sizeof(chunk) : (totalBytes - received);
-        int ret = httpd_req_recv(req, chunk, toRead);
+        int toRead = (totalBytes - received > CHUNK_SIZE) ? CHUNK_SIZE : (totalBytes - received);
+        int ret = httpd_req_recv(req, chunk.get(), toRead);
         if (ret <= 0) {
             if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
                 continue;
@@ -342,33 +356,20 @@ esp_err_t WebServer::handleUpload(httpd_req_t* req) {
         // Khi tích hợp thẻ nhớ SD hoặc bộ đệm in nhiệt, chunk sẽ được ghi tiếp vào đây.
     }
 
-    std::string sizeStr = formatBytes(totalBytes);
-    auto& ws = WebServer::getInstance();
+    // Lưu vào hàng đợi và Flash NVS thông qua FileManager
+    FileManager::getInstance().addFile(filename, totalBytes);
 
-    bool exists = false;
-    for (auto& doc : ws.uploadedFiles_) {
-        if (doc.name == filename) {
-            doc.sizeStr = sizeStr;
-            exists = true;
-            break;
-        }
-    }
-    if (!exists) {
-        ws.uploadedFiles_.push_back({filename, sizeStr});
-    }
-
-    ESP_LOGI(TAG, "Đã nhận tài liệu: %s (%s)", filename.c_str(), sizeStr.c_str());
-
+    // Yêu cầu trình duyệt đóng kết nối TCP cũ để reset socket sạch sẽ cho tệp tiếp theo
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
 }
 
 esp_err_t WebServer::handleFiles(httpd_req_t* req) {
-    auto& ws = WebServer::getInstance();
-
     if (req->method == HTTP_GET) {
+        auto files = FileManager::getInstance().getFiles();
         cJSON* root = cJSON_CreateArray();
-        for (const auto& doc : ws.uploadedFiles_) {
+        for (const auto& doc : files) {
             cJSON* item = cJSON_CreateObject();
             cJSON_AddStringToObject(item, "name", doc.name.c_str());
             cJSON_AddStringToObject(item, "size", doc.sizeStr.c_str());
@@ -383,23 +384,21 @@ esp_err_t WebServer::handleFiles(httpd_req_t* req) {
         cJSON_Delete(root);
         return ESP_OK;
     } else if (req->method == HTTP_DELETE) {
-        char query[256] = {0};
         std::string filename;
-        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-            char val[128] = {0};
-            if (httpd_query_key_value(query, "filename", val, sizeof(val)) == ESP_OK) {
-                filename = urlDecode(val);
+
+        // Tìm tên file trực tiếp từ URL không bị giới hạn bộ đệm
+        const char* p = strstr(req->uri, "filename=");
+        if (p) {
+            p += 9;
+            const char* end = strchr(p, '&');
+            std::string rawName = end ? std::string(p, end - p) : std::string(p);
+            if (!rawName.empty()) {
+                filename = urlDecode(rawName);
             }
         }
 
         if (!filename.empty()) {
-            for (auto it = ws.uploadedFiles_.begin(); it != ws.uploadedFiles_.end(); ++it) {
-                if (it->name == filename) {
-                    ws.uploadedFiles_.erase(it);
-                    ESP_LOGI(TAG, "Đã xóa tài liệu khỏi hàng đợi: %s", filename.c_str());
-                    break;
-                }
-            }
+            FileManager::getInstance().removeFile(filename);
         }
 
         httpd_resp_set_type(req, "application/json");

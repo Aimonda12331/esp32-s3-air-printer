@@ -4,13 +4,9 @@
 #include <vector>
 #include "esp_err.h"
 #include "esp_http_server.h"
+#include "file_manager.hpp"
 
 namespace printer {
-
-struct PrintDocument {
-    std::string name;
-    std::string sizeStr;
-};
 
 class WebServer {
 public:
@@ -22,6 +18,7 @@ public:
     std::string getDeviceName();
     esp_err_t setDeviceName(const std::string& name);
     void updateMdns(const std::string& hostname);
+    void clearAllFiles() { FileManager::getInstance().clearAll(); }
 
 private:
     WebServer() = default;
@@ -29,7 +26,6 @@ private:
 
     httpd_handle_t serverHandle_{nullptr};
     std::string deviceName_;
-    std::vector<PrintDocument> uploadedFiles_;
 
     // Các hàm xử lý HTTP
     static esp_err_t handleIndexHtml(httpd_req_t* req);

@@ -34,9 +34,23 @@ static const char INDEX_HTML[] = R"rawliteral(
         .drop-text { font-size: 15px; font-weight: 600; color: #1a73e8; margin-bottom: 4px; }
         .drop-hint { font-size: 12px; color: #70757a; }
 
-        /* Progress Bar */
-        .progress-container { display: none; margin-top: 15px; background: #e0e0e0; border-radius: 8px; overflow: hidden; height: 10px; }
-        .progress-bar { height: 100%; width: 0%; background: #1a73e8; transition: width 0.2s; }
+        /* Multi-file Upload Task Queue */
+        .upload-tasks-container { display: none; margin-top: 16px; border: 1.5px solid #d2e3fc; border-radius: 12px; padding: 14px; background: #f8fbff; }
+        .upload-tasks-summary { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 700; color: #1a73e8; margin-bottom: 10px; }
+        .upload-task-item { background: #ffffff; border: 1px solid #dadce0; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.03); }
+        .upload-task-item:last-child { margin-bottom: 0; }
+        .upload-task-header { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+        .upload-task-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 270px; color: #202124; }
+        .upload-task-meta { font-size: 11px; color: #5f6368; flex-shrink: 0; }
+        .upload-task-bar-wrap { background: #e8eaed; border-radius: 6px; height: 8px; overflow: hidden; width: 100%; }
+        .upload-task-bar { height: 100%; width: 0%; background: #1a73e8; border-radius: 6px; transition: width 0.15s ease; }
+        .upload-task-bar.bar-success { background: #1e8e3e; }
+        .upload-task-bar.bar-error { background: #d93025; }
+        .upload-task-footer { display: flex; justify-content: space-between; font-size: 11px; font-weight: 500; margin-top: 5px; }
+        .task-status-wait { color: #80868b; }
+        .task-status-running { color: #1a73e8; font-weight: 600; }
+        .task-status-success { color: #1e8e3e; font-weight: 600; }
+        .task-status-error { color: #d93025; font-weight: 600; }
 
         /* File List */
         .file-list-title { font-size: 14px; font-weight: 700; color: #444; margin: 24px 0 12px 0; display: flex; justify-content: space-between; align-items: center; }
@@ -92,13 +106,22 @@ static const char INDEX_HTML[] = R"rawliteral(
             <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
                 <div class="drop-icon">📤</div>
                 <div class="drop-text">Kéo thả file hoặc thư mục vào đây</div>
-                <div class="drop-hint">Hỗ trợ file in: PDF, TXT, DOCX, PNG, JPG, G-CODE...</div>
-                <input type="file" id="fileInput" multiple style="display:none;" onchange="uploadFiles(this.files)">
+                <div class="drop-hint">Hỗ trợ chọn cùng lúc nhiều file hoặc nguyên cả thư mục</div>
+                <div style="display:flex; gap:10px; justify-content:center; margin-top:12px;">
+                    <button type="button" class="btn-action" style="background:#e8f0fe; color:#1a73e8; border:1px solid #aecbfa;" onclick="event.stopPropagation(); document.getElementById('fileInput').click()">📄 Chọn nhiều file</button>
+                    <button type="button" class="btn-action" style="background:#e8f0fe; color:#1a73e8; border:1px solid #aecbfa;" onclick="event.stopPropagation(); document.getElementById('folderInput').click()">📁 Chọn cả thư mục</button>
+                </div>
+                <input type="file" id="fileInput" multiple style="display:none;" onchange="uploadFiles(this.files); this.value='';">
+                <input type="file" id="folderInput" webkitdirectory directory multiple style="display:none;" onchange="uploadFiles(this.files); this.value='';">
             </div>
 
-            <!-- Upload Progress Bar -->
-            <div id="progressContainer" class="progress-container">
-                <div id="progressBar" class="progress-bar"></div>
+            <!-- Multi-file Upload Task Queue Container -->
+            <div id="uploadTasksContainer" class="upload-tasks-container">
+                <div class="upload-tasks-summary">
+                    <span id="uploadSummaryTitle">Tiến trình tải lên</span>
+                    <span id="uploadSummaryCount" style="color:#1a73e8; font-size:12px;">0%</span>
+                </div>
+                <div id="uploadTasksList"></div>
             </div>
 
             <div id="uploadStatus" class="status-box"></div>
@@ -218,50 +241,158 @@ static const char INDEX_HTML[] = R"rawliteral(
             }, false);
         }
 
-        // Tải file lên ESP32
-        function uploadFiles(files) {
-            if (!files || files.length === 0) return;
-            const file = files[0]; // Tải từng file
+        function formatBytes(bytes) {
+            if (!bytes || bytes <= 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
 
-            const pContainer = document.getElementById('progressContainer');
-            const pBar = document.getElementById('progressBar');
+        function uploadSingleFile(file, displayName, onProgress) {
+            return new Promise((resolve) => {
+                const xhr = new XMLHttpRequest();
+                const encodedName = encodeURIComponent(displayName);
+                xhr.open('POST', '/api/upload?filename=' + encodedName, true);
+                
+                // Gửi kèm tiêu đề X-Filename để ESP32 đọc chính xác tên dài
+                xhr.setRequestHeader('X-Filename', encodedName);
+                xhr.timeout = 180000; // 3 phút cho các file lớn > 25MB
+
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable && onProgress) {
+                        onProgress(e.loaded, e.total);
+                    }
+                };
+
+                xhr.onload = () => {
+                    resolve(xhr.status === 200);
+                };
+
+                xhr.onerror = () => {
+                    resolve(false);
+                };
+
+                xhr.ontimeout = () => {
+                    resolve(false);
+                };
+
+                xhr.send(file);
+            });
+        }
+
+        // Tải danh sách nhiều file / thư mục lên ESP32 tuần tự
+        async function uploadFiles(files) {
+            if (!files || files.length === 0) return;
+
+            // Chuyển ngay FileList sang mảng tĩnh JS độc lập
+            // Vì nếu input.value = '' được gọi, FileList gốc của trình duyệt sẽ bị reset về rỗng
+            const fileList = Array.from(files);
+            const total = fileList.length;
+
+            const tasksContainer = document.getElementById('uploadTasksContainer');
+            const tasksList = document.getElementById('uploadTasksList');
+            const summaryTitle = document.getElementById('uploadSummaryTitle');
+            const summaryCount = document.getElementById('uploadSummaryCount');
             const stBox = document.getElementById('uploadStatus');
 
-            pContainer.style.display = 'block';
-            pBar.style.width = '0%';
+            tasksContainer.style.display = 'block';
+            stBox.style.display = 'none';
+
+            summaryTitle.textContent = `Tiến trình tải lên (${total} tệp)`;
+            summaryCount.textContent = `0/${total} hoàn tất`;
+
+            // 1. Dựng sẵn khung tiến trình cho TỪNG tệp ngay từ đầu
+            tasksList.innerHTML = fileList.map((file, idx) => {
+                const displayName = file.webkitRelativePath || file.name;
+                const sizeStr = formatBytes(file.size);
+                const safeName = displayName.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                return `
+                    <div class="upload-task-item" id="task-item-${idx}">
+                        <div class="upload-task-header">
+                            <span class="upload-task-name" title="${safeName}">📄 ${safeName}</span>
+                            <span class="upload-task-meta">${sizeStr}</span>
+                        </div>
+                        <div class="upload-task-bar-wrap">
+                            <div class="upload-task-bar" id="pbar-${idx}"></div>
+                        </div>
+                        <div class="upload-task-footer">
+                            <span id="pstatus-${idx}" class="task-status-wait">⏳ Đang chờ...</span>
+                            <span id="ppercent-${idx}" style="color:#5f6368;">0%</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            let completedCount = 0;
+
+            // 2. Chạy tải lần lượt từng file từ mảng fileList tĩnh
+            for (let i = 0; i < total; i++) {
+                const file = fileList[i];
+                const displayName = file.webkitRelativePath || file.name;
+                const pbar = document.getElementById(`pbar-${i}`);
+                const pstatus = document.getElementById(`pstatus-${i}`);
+                const ppercent = document.getElementById(`ppercent-${i}`);
+
+                if (pstatus) {
+                    pstatus.className = 'task-status-running';
+                    pstatus.innerHTML = `<span class="spinner" style="width:11px;height:11px;border-width:2px;margin-right:4px;"></span> Đang tải...`;
+                }
+
+                try {
+                    const success = await uploadSingleFile(file, displayName, (loaded, totalBytes) => {
+                        const percent = Math.round((loaded / totalBytes) * 100);
+                        if (pbar) pbar.style.width = percent + '%';
+                        if (ppercent) ppercent.textContent = `${percent}% (${formatBytes(loaded)} / ${formatBytes(totalBytes)})`;
+                    });
+
+                    if (success) {
+                        completedCount++;
+                        if (pbar) {
+                            pbar.style.width = '100%';
+                            pbar.classList.add('bar-success');
+                        }
+                        if (pstatus) {
+                            pstatus.className = 'task-status-success';
+                            pstatus.textContent = '✅ Đã tải xong';
+                        }
+                        if (ppercent) ppercent.textContent = '100%';
+                        // Cập nhật ngay hàng đợi bên dưới khi mỗi file xong
+                        loadFileList();
+                    } else {
+                        if (pbar) pbar.classList.add('bar-error');
+                        if (pstatus) {
+                            pstatus.className = 'task-status-error';
+                            pstatus.textContent = '❌ Tải thất bại';
+                        }
+                    }
+                } catch (err) {
+                    if (pbar) pbar.classList.add('bar-error');
+                    if (pstatus) {
+                        pstatus.className = 'task-status-error';
+                        pstatus.textContent = '❌ Lỗi kết nối';
+                    }
+                }
+
+                summaryCount.textContent = `${completedCount}/${total} hoàn tất`;
+
+                // Nghỉ 500ms giữa 2 tệp để ESP32 giải phóng socket và ổn định bộ đệm mạng
+                if (i < total - 1) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+            }
+
+            // 3. Thông báo tổng kết
             stBox.style.display = 'block';
-            stBox.className = 'status-box loading';
-            stBox.innerHTML = `<div class="spinner"></div> Đang tải lên: <b>${file.name}</b>...`;
-
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/upload?filename=' + encodeURIComponent(file.name), true);
-
-            xhr.upload.onprogress = (e) => {
-                if (e.lengthComputable) {
-                    const percent = Math.round((e.loaded / e.total) * 100);
-                    pBar.style.width = percent + '%';
-                }
-            };
-
-            xhr.onload = () => {
-                pContainer.style.display = 'none';
-                if (xhr.status === 200) {
-                    stBox.className = 'status-box success';
-                    stBox.innerHTML = `✅ Đã tải file <b>${file.name}</b> thành công! Sẵn sàng in.`;
-                    loadFileList();
-                } else {
-                    stBox.className = 'status-box error';
-                    stBox.innerHTML = `❌ Tải lên thất bại! Mã lỗi: ${xhr.status}`;
-                }
-            };
-
-            xhr.onerror = () => {
-                pContainer.style.display = 'none';
+            if (completedCount === total) {
+                stBox.className = 'status-box success';
+                stBox.innerHTML = `✅ Đã tải xong toàn bộ <b>${completedCount}</b> tài liệu!`;
+            } else {
                 stBox.className = 'status-box error';
-                stBox.innerHTML = `❌ Lỗi mạng khi tải file.`;
-            };
+                stBox.innerHTML = `⚠️ Đã tải ${completedCount}/${total} tài liệu. Có tệp gặp sự cố kết nối!`;
+            }
 
-            xhr.send(file);
+            loadFileList();
         }
 
         // Lấy danh sách file đang có
@@ -277,21 +408,25 @@ static const char INDEX_HTML[] = R"rawliteral(
                     return;
                 }
 
-                container.innerHTML = files.map(f => `
+                container.innerHTML = files.map(f => {
+                    const encodedName = encodeURIComponent(f.name);
+                    const safeDisplayName = f.name.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+                    return `
                     <div class="file-item">
                         <div class="file-info">
                             <div class="file-icon">📄</div>
                             <div>
-                                <div class="file-name" title="${f.name}">${f.name}</div>
+                                <div class="file-name" title="${safeDisplayName}">${safeDisplayName}</div>
                                 <div class="file-size">${f.size} • ${f.time || 'Mới nhận'}</div>
                             </div>
                         </div>
                         <div class="file-actions">
-                            <button class="btn-action btn-print" onclick="printFile('${f.name}')">🖨️ In</button>
-                            <button class="btn-action btn-del" onclick="deleteFile('${f.name}')">Xóa</button>
+                            <button class="btn-action btn-print" onclick="printFile(decodeURIComponent('${encodedName}'))">🖨️ In</button>
+                            <button class="btn-action btn-del" onclick="deleteFile(decodeURIComponent('${encodedName}'))">Xóa</button>
                         </div>
                     </div>
-                `).join('');
+                `;
+                }).join('');
             } catch (e) {
                 container.innerHTML = `<div style="text-align:center; color:#c5221f;">Lỗi tải danh sách file</div>`;
             }

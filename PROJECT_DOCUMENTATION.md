@@ -44,6 +44,7 @@ graph TD
         LedComp["led_arlarm (LedController)"]
         WifiComp["wifi_manager (WifiManager)"]
         WebComp["web_server (WebServer & mDNS)"]
+        FileComp["file_manager (FileManager & Flash NVS)"]
     end
 
     subgraph Application ["Lớp Ứng Dụng (Application Layer)"]
@@ -55,10 +56,13 @@ graph TD
     RF <--> WifiComp
     FLASH <--> WifiComp
     FLASH <--> WebComp
+    FLASH <--> FileComp
 
     LedComp <--> MainApp
     WifiComp <--> MainApp
     WebComp <--> MainApp
+    FileComp <--> WebComp
+    FileComp <--> MainApp
     SPA <--> WebComp
 ```
 
@@ -118,6 +122,7 @@ graph TD
       * Thanh % tiến trình tải lên thời gian thực.
       * Thuật toán tải lên tuần tự (*Sequential Upload*) bảo vệ bộ nhớ RAM và socket của vi điều khiển.
       * Danh sách hàng đợi in ấn hiển thị tên tệp, dung lượng kèm 2 nút thao tác: **`🖨️ In`** và **`Xóa`**.
+      * **Lưu trữ bền vững trong Flash NVS:** Toàn bộ danh sách tài liệu trong hàng đợi được tự động lưu vĩnh viễn vào Flash NVS (`app_cfg`). Khi tắt nguồn hoặc khởi động lại, danh sách này vẫn hiển thị nguyên vẹn trên Web, chỉ bị xóa khi người dùng bấm nút **`Xóa`** hoặc nhấn giữ nút **BOOT 10 giây (Factory Reset)**.
     * **Tab 2: ⚙️ Cài Đặt Wi-Fi:**
       * Ô nhập tên máy in mDNS mong muốn (kèm tính năng tự động chuẩn hóa slug và xem trước URL).
       * Nút quét danh sách Wi-Fi xung quanh kèm độ mạnh sóng RSSI và biểu tượng bảo mật.
@@ -136,6 +141,17 @@ graph TD
   | `GET` | `/api/files` | Trả về danh sách JSON các tệp đang chờ in |
   | `DELETE`| `/api/files` | Xóa tài liệu khỏi hàng đợi theo tham số `filename` |
   | `POST`| `/api/print` | Kích hoạt lệnh in cho tài liệu chỉ định |
+
+---
+
+### 3.4. `components/file_manager` - Quản lý Hàng Đợi Tệp Tin & Lưu Trữ Flash NVS
+* **Tệp tin:** `file_manager.hpp`, `file_manager.cpp`, `CMakeLists.txt`.
+* **Tính năng chính:**
+  * Được tách thành một **module độc lập** để quản lý toàn bộ dữ liệu tài liệu tải lên.
+  * Tự động lưu trữ danh sách tệp (`PrintDocument`) vào Flash NVS (`app_cfg` -> `docs_queue`).
+  * Khôi phục danh sách hàng đợi in nguyên vẹn sau khi mất điện hoặc khởi động lại.
+  * Hỗ trợ các thao tác hướng đối tượng thread-safe (`std::mutex`): `addFile`, `removeFile`, `clearAll`, `getFiles`, `hasFile`.
+  * Cung cấp tiện ích định dạng dung lượng `formatBytes` (B, KB, MB).
 
 ---
 
@@ -159,6 +175,18 @@ Trong quá trình xây dựng dự án, các lỗi kỹ thuật lớn sau đây 
    * *Hiện tượng:* `CMake Error at managed_components/espressif__mdns/CMakeLists.txt:80: CONFIG_MDNS_ENABLE_CONSOLE_CLI is enabled but the console component is not in the build.`
    * *Nguyên nhân:* Dự án sử dụng `MINIMAL_BUILD ON` nên các component không khai báo trực tiếp sẽ bị loại trừ.
    * *Giải pháp:* Bổ sung `console` vào mục `REQUIRES` trong `components/web_server/CMakeLists.txt`.
+5. **Lỗi Tràn ngăn xếp HTTP Server Task khi Tải file lớn (`rst:0xc RTC_SW_CPU_RST`):**
+   * *Hiện tượng:* Khi tải file lớn (> 20MB), ESP32-S3 crash tại `httpd_req_recv` do cạn kiệt stack FreeRTOS.
+   * *Nguyên nhân:* HTTP Server mặc định chỉ cấp 4096 bytes stack; việc đặt mảng đệm stream và parse header trực tiếp trên stack vượt quá dung lượng cho phép.
+   * *Giải pháp:* Nâng `config.stack_size = 10240;` (10 KB) và chuyển mảng bộ đệm `chunk` sang cấp phát động trên Heap (`std::make_unique<char[]>(4096)`).
+6. **Lỗi Tệp hiển thị "tai_lieu_chua_dat_ten" và Tệp thứ 2 bị dừng:**
+   * *Hiện tượng:* Tên tài liệu dài hoặc có ký tự đặc biệt bị đổi thành `tai_lieu_chua_dat_ten`; tệp thứ 2 trong hàng đợi bị kẹt ở trạng thái "Đang chờ... 0%".
+   * *Nguyên nhân:*
+     1. Hàm parse URL cũ dùng bộ đệm cố định 64 bytes khiến tên dài bị cắt xén (truncation).
+     2. Trong JavaScript, câu lệnh `this.value = ''` của thẻ `<input>` thực thi đồng bộ đã làm reset đối tượng sống `FileList` của trình duyệt về rỗng trước khi vòng lặp bất đồng bộ đọc đến tệp thứ 2 (`TypeError: Cannot read properties of undefined`).
+   * *Giải pháp:*
+     1. Đọc tên tệp thông qua tiêu đề `X-Filename` hoặc trực tiếp từ con trỏ `req->uri` với hàm giải mã `urlDecode()`.
+     2. Chuyển đổi `FileList` sang mảng tĩnh JavaScript (`Array.from(files)`) ngay đầu hàm `uploadFiles()` trước khi thực hiện bất kỳ tác vụ bất đồng bộ nào.
 
 ---
 
@@ -179,7 +207,14 @@ Trong quá trình xây dựng dự án, các lỗi kỹ thuật lớn sau đây 
    * Nhập tên máy in mong muốn (ví dụ: `mayin-phongkhach`).
    * Bấm **"Quét danh sách Wi-Fi"** và chọn Wi-Fi gia đình, nhập mật khẩu.
    * Bấm nút **"LƯU & KẾT NỐI"**.
-4. **Trải nghiệm in ấn:**
+   * Hệ thống sẽ tự động lưu thông tin Wi-Fi vào Flash NVS. Ở các lần cắm điện/khởi động sau, ESP32 sẽ **tự động kết nối lại** mà không cần nhập lại.
+    * **Tự động tắt AP khi vào STA:** Ngay khi ESP32-S3 nhận được IP từ Wi-Fi nhà, điểm phát AirPrinter-xxxx sẽ được **tự động tắt hoàn toàn** để giảm nhiệt, tiết kiệm điện và tránh sụt áp. Nếu Wi-Fi nhà bị mất kết nối, hệ thống sẽ tự động bật lại AP để người dùng cấu hình lại.
+4. **Khôi phục cài đặt gốc bằng Nút BOOT (Factory Reset):**
+   * Nhấn và giữ **nút BOOT (GPIO 0)** trên bo mạch trong **đủ 10 giây**.
+   * Đèn LED trạng thái sẽ **nhấp nháy đỏ liên tục** xác nhận reset.
+   * Hệ thống sẽ xóa sạch toàn bộ: Wi-Fi đã lưu, tên máy in mDNS, toàn bộ hàng đợi tệp đã tải lên.
+   * ESP32 tự động khởi động lại về chế độ phát **AP ban đầu** (`AirPrinter-XXXX`, LED thở Xanh Dương).
+5. **Trải nghiệm in ấn:**
    * Đèn LED trạng thái sẽ đổi: **Thở Xanh Dương** $\rightarrow$ **Nháy Vàng Nhanh** $\rightarrow$ **Sáng Xanh Lá Cố Định**.
    * Web tự động chuyển sang trang **📁 In Ấn & Tải File**.
    * Bấm **"Chọn cả thư mục"** hoặc kéo thả tài liệu để tải lên.
