@@ -1,78 +1,93 @@
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
+# ==============================================================================
+# ESP-IDF & ESP32-S3 Air Printer - Git Ignore
+# ==============================================================================
 
-# Directory metadata
-.directory
-
-# Temporary files
-*~
-*.swp
-*.swo
-*.bak
-*.tmp
-
-# Log files
-*.log
-
-# Build artifacts and directories
-**/build/
+# --- ESP-IDF Build Outputs ---
 build/
-*.o
-*.a
-*.out
-*.exe # For any host-side utilities compiled on Windows
-
-# ESP-IDF specific build outputs
+**/build/
 *.bin
 *.elf
 *.map
-flasher_args.json # Generated in build directory
-sdkconfig.old
-sdkconfig
+flasher_args.json
 
-# ESP-IDF dependencies
-# For older versions or manual component management
+# --- ESP-IDF Configurations ---
+# Giữ lại 'sdkconfig' vì dự án lưu cấu hình 16MB Flash, Octal PSRAM và phân vùng.
+# Chỉ bỏ qua các tệp sao lưu cấu hình tạm thời:
+sdkconfig.old
+sdkconfig.ci
+sdkconfig.rename
+
+# --- ESP-IDF Component Manager ---
+# Thư mục thư viện tải tự động từ Espressif Registry (led_strip, mdns, ...)
+managed_components/
+dependencies.lock.old
+
+# Caches nội bộ của Espressif
 /components/.idf/
 **/components/.idf/
-# For modern ESP-IDF component manager
-managed_components/
-# If ESP-IDF tools are installed/referenced locally to the project
 .espressif/
 
-# CMake generated files
+# --- CMake Artifacts ---
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 install_manifest.txt
 CTestTestfile.cmake
+compile_commands.json
 
-# Python environment files
-*.pyc
-*.pyo
-*.pyd
+# --- Binaries & Object Files ---
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# --- VS Code & IDE Caches ---
+# Giữ lại cấu hình workspace cần thiết, loại bỏ cache và log
+.vscode/*
+!.vscode/settings.json
+!.vscode/c_cpp_properties.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.vscode/*.log
+.vscode/ipch/
+.vscode/.browse.*
+
+# --- Language Servers (Clangd / CCLS) ---
+.clangd/
+.ccls-cache/
+
+# --- Python Environments & Caches (ESP-IDF tools) ---
 __pycache__/
+*.py[cod]
+*$py.class
 *.egg-info/
 dist/
-
-# Virtual environment folders
 venv/
 .venv/
 env/
 
-# Language Servers
-.clangd/
-.ccls-cache/
-compile_commands.json
+# --- Temporary & Backup Files ---
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+*.log
 
-# Windows specific
+# --- OS Specific Files ---
+# Windows
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+$RECYCLE.BIN/
 
-# User-specific configuration files
-*.user
-*.workspace # General workspace files, can be from various tools
-*.suo       # Visual Studio Solution User Options
-*.sln.docstates # Visual Studio
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+.directory
